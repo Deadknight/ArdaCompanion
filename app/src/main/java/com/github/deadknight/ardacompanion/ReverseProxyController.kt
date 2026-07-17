@@ -10,6 +10,7 @@ import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.telephony.SubscriptionManager
@@ -39,6 +40,7 @@ data class ArdaWifiOffer(
     val passphrase: String?,
     val security: String,
     val bssid: String?,
+    val apIp: String?,
     val proxyPort: Int,
 ) {
     companion object {
@@ -52,6 +54,8 @@ data class ArdaWifiOffer(
                 passphrase = if (json.isNull("psk")) null else json.getString("psk"),
                 security = json.optString("security", "wpa2"),
                 bssid = if (json.isNull("bssid")) null else json.optString("bssid")
+                    .takeIf { it.isNotBlank() },
+                apIp = if (json.isNull("ap_ip")) null else json.optString("ap_ip")
                     .takeIf { it.isNotBlank() },
                 proxyPort = json.optInt("proxy_port", 5285),
             )
@@ -71,13 +75,7 @@ data class ArdaProxyEndpoint(
 class ReverseProxyController(private val context: Context) : Closeable {
     private val connectivityManager =
         context.getSystemService(ConnectivityManager::class.java)
-    private val wifiManager =
-        context.applicationContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val wifiApprovalPreferences = context.getSharedPreferences(
-        WIFI_APPROVAL_PREFS,
-        Context.MODE_PRIVATE,
-    )
 
     @Volatile private var wifiNetwork: Network? = null
     @Volatile private var cellularNetwork: Network? = null
@@ -91,9 +89,10 @@ class ReverseProxyController(private val context: Context) : Closeable {
     ): ArdaProxyEndpoint {
         close()
 
-        // The local-only Wi-Fi transport is an independent gate. A missing SIM or
-        // cellular Network must not cancel the Android Wi-Fi selection request,
-        // close RFCOMM, or hide a successful AAOS LocalOnlyHotspot connection.
+        // The local Wi-Fi transport is an independent gate. The first run saves
+        // the fixed AAOS network through Android Settings; later runs only observe
+        // Android's normal saved-network auto-join. Missing cellular must not close
+        // RFCOMM or hide a successful local Wi-Fi connection.
         val wifi = requestLocalWifiBlocking(offer, timeoutMs)
         val phoneIp = waitForIpv4Address(wifi, IPV4_WAIT_TIMEOUT_MS)
             ?: error("Phone has no IPv4 address on ARDA local-only Wi-Fi")
@@ -139,228 +138,295 @@ class ReverseProxyController(private val context: Context) : Closeable {
         offer: ArdaWifiOffer,
         timeoutMs: Long,
     ): Network {
-        val platformBssid = normalizeBssid(offer.bssid)
-        val savedBssid = loadSavedBssid(offer)
-        val discoveredAccessPoint =
-            if (platformBssid == null && savedBssid == null) {
-                waitForVisibleAccessPoint(offer.ssid, WIFI_DISCOVERY_TIMEOUT_MS)
-            } else {
-                null
-            }
-        val preferredBssid =
-            platformBssid ?: savedBssid ?: discoveredAccessPoint?.bssid
-        val preferredSource = when {
-            platformBssid != null -> "PLATFORM"
-            savedBssid != null -> "SAVED_APPROVAL"
-            discoveredAccessPoint != null -> "SCAN_DISCOVERY"
-            else -> null
+        require(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            "ARDA local Wi-Fi requires Android 11 or newer"
         }
 
-        if (preferredBssid != null) {
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_BSSID_SOURCE=$preferredSource",
-            )
-            ArdaCompanionState.log(
-                if (savedBssid != null) {
-                    "ARDA_RN3B_PHONE_WIFI_RECONNECT_ATTEMPT=EXACT_SSID_BSSID"
-                } else {
-                    "ARDA_RN3B_PHONE_WIFI_FIRST_APPROVAL_ATTEMPT=EXACT_SSID_BSSID"
-                },
-            )
-            requestLocalWifiAttempt(
-                offer = offer,
-                requestedBssid = preferredBssid,
-                timeoutMs = if (savedBssid != null) {
-                    minOf(timeoutMs, EXACT_BSSID_RECONNECT_TIMEOUT_MS)
-                } else {
-                    timeoutMs
-                },
-                attemptName = "EXACT_SSID_BSSID",
-            )?.let { return it }
-
-            if (platformBssid == null && savedBssid != null) {
-                clearSavedBssid()
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_SAVED_BSSID=STALE_CLEARED",
-                )
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_RECONNECT_FALLBACK=EXACT_SSID_ONLY",
-                )
-            } else {
-                error("Android rejected or could not connect to the visible ARDA access point")
-            }
-        } else {
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_BSSID_SOURCE=UNAVAILABLE_AFTER_SCAN",
-            )
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_DISCOVERY_FALLBACK=EXACT_SSID_ONLY",
-            )
-        }
-
-        return requestLocalWifiAttempt(
+        // A saved configuration is useful for normal Android auto-join, but it
+        // does not provide an on-demand connection guarantee. First accept an
+        // already-connected saved network. If Android does not select it, keep
+        // the saved configuration and actively request the same local-only AP.
+        // The active request remains registered for the complete ARDA session.
+        val precheckTimeoutMs = minOf(timeoutMs, AUTOJOIN_PRECHECK_TIMEOUT_MS)
+        ArdaCompanionState.log(
+            "ARDA_RN3B_PHONE_SAVED_NETWORK_PRECHECK=START " +
+                "ssid=${offer.ssid};timeout_ms=$precheckTimeoutMs",
+        )
+        val existingNetwork = waitForSavedNetworkBlocking(
             offer = offer,
-            requestedBssid = null,
-            timeoutMs = timeoutMs,
-            attemptName = "EXACT_SSID_ONLY",
-        ) ?: error("Android rejected or could not find ARDA local Wi-Fi")
-    }
-
-    private data class VisibleAccessPoint(
-        val bssid: String,
-        val frequencyMhz: Int,
-        val rssiDbm: Int,
-    )
-
-    @Suppress("DEPRECATION")
-    private fun waitForVisibleAccessPoint(
-        ssid: String,
-        timeoutMs: Long,
-    ): VisibleAccessPoint? {
-        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
-        var lastScanRequestAt = 0L
-        var scanReadable = true
-        var lastStartScanResult: Boolean? = null
-
-        ArdaCompanionState.log(
-            "ARDA_RN3B_PHONE_WIFI_DISCOVERY_WAIT=START " +
-                "ssid=$ssid;timeout_ms=$timeoutMs",
+            timeoutMs = precheckTimeoutMs,
+            phase = "PRECHECK",
         )
-        while (android.os.SystemClock.elapsedRealtime() < deadline) {
-            val results = runCatching { wifiManager.scanResults }
-                .onFailure {
-                    scanReadable = false
-                    ArdaCompanionState.log(
-                        "ARDA_RN3B_PHONE_WIFI_SCAN_RESULTS=UNAVAILABLE:" +
-                            "${it.javaClass.simpleName}:${it.safeMessage()}",
-                    )
-                }
-                .getOrDefault(emptyList())
+        if (existingNetwork != null) {
+            ArdaWifiEnrollmentCoordinator.rememberObservedSavedNetwork(context, offer)
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_WIFI_CONNECT_MODE=SAVED_NETWORK_ALREADY_CONNECTED",
+            )
+            return existingNetwork
+        }
 
-            val match = results
-                .asSequence()
-                .filter { it.SSID == ssid }
-                .maxByOrNull { it.level }
-            val bssid = normalizeBssid(match?.BSSID)
-            if (match != null && bssid != null) {
-                val accessPoint = VisibleAccessPoint(
-                    bssid = bssid,
-                    frequencyMhz = match.frequency,
-                    rssiDbm = match.level,
-                )
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_DISCOVERY=PASS " +
-                        "bssid=${accessPoint.bssid};" +
-                        "frequency_mhz=${accessPoint.frequencyMhz};" +
-                        "rssi_dbm=${accessPoint.rssiDbm}",
-                )
-                return accessPoint
-            }
+        val enrolled = ArdaWifiEnrollmentCoordinator.ensureSavedNetworkBlocking(
+            context = context,
+            offer = offer,
+            timeoutMs = SAVED_NETWORK_ENROLLMENT_TIMEOUT_MS,
+        )
+        require(enrolled) { "ARDA Wi-Fi was not saved by the user" }
 
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastScanRequestAt >= WIFI_SCAN_RETRY_INTERVAL_MS) {
-                lastScanRequestAt = now
-                lastStartScanResult = runCatching { wifiManager.startScan() }
-                    .onFailure {
-                        ArdaCompanionState.log(
-                            "ARDA_RN3B_PHONE_WIFI_SCAN_REQUEST=ERROR:" +
-                                "${it.javaClass.simpleName}:${it.safeMessage()}",
-                        )
-                    }
-                    .getOrNull()
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_SCAN_REQUEST=" +
-                        when (lastStartScanResult) {
-                            true -> "STARTED"
-                            false -> "THROTTLED_OR_REJECTED"
-                            null -> "UNAVAILABLE"
-                        },
-                )
-            }
-            Thread.sleep(WIFI_SCAN_POLL_INTERVAL_MS)
+        // ACTION_WIFI_ADD_NETWORKS normally triggers a connection immediately
+        // after a new save. Give that system-owned connection a short chance
+        // before issuing the explicit local-only request.
+        ArdaCompanionState.log(
+            "ARDA_RN3B_PHONE_SAVED_NETWORK_POST_ENROLLMENT_CHECK=START " +
+                "ssid=${offer.ssid};timeout_ms=$POST_ENROLLMENT_AUTOJOIN_TIMEOUT_MS",
+        )
+        val postEnrollmentNetwork = waitForSavedNetworkBlocking(
+            offer = offer,
+            timeoutMs = minOf(timeoutMs, POST_ENROLLMENT_AUTOJOIN_TIMEOUT_MS),
+            phase = "POST_ENROLLMENT",
+        )
+        if (postEnrollmentNetwork != null) {
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_WIFI_CONNECT_MODE=SAVED_NETWORK_AUTOJOIN",
+            )
+            return postEnrollmentNetwork
         }
 
         ArdaCompanionState.log(
-            "ARDA_RN3B_PHONE_WIFI_DISCOVERY=NOT_SEEN " +
-                "ssid=$ssid;scan_readable=$scanReadable;" +
-                "last_start_scan=${lastStartScanResult ?: "unknown"}",
+            "ARDA_RN3B_PHONE_WIFI_CONNECT_MODE=ACTIVE_LOCAL_ONLY_REQUEST",
         )
-        return null
+        return requestSpecificLocalWifiBlocking(offer, timeoutMs)
     }
 
-    private fun requestLocalWifiAttempt(
+    private fun requestSpecificLocalWifiBlocking(
         offer: ArdaWifiOffer,
-        requestedBssid: String?,
         timeoutMs: Long,
-        attemptName: String,
-    ): Network? {
-        val latch = CountDownLatch(1)
-        val unavailable = AtomicBoolean(false)
-        val availableNetwork = java.util.concurrent.atomic.AtomicReference<Network?>()
-        val specifier = buildWifiSpecifier(offer, requestedBssid)
+    ): Network {
+        val wifiManager = context.applicationContext
+            .getSystemService(WifiManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val concurrencySupported = runCatching {
+                wifiManager?.isStaConcurrencyForLocalOnlyConnectionsSupported == true
+            }.getOrDefault(false)
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_STA_CONCURRENCY_LOCAL_ONLY=$concurrencySupported",
+            )
+        }
+
+        val specifierBuilder = WifiNetworkSpecifier.Builder()
+            .setSsid(offer.ssid)
+        val security = offer.security.lowercase(Locale.US)
+        val passphrase = offer.passphrase
+        when {
+            passphrase.isNullOrBlank() || security == "open" -> Unit
+            security.contains("wpa3") || security.contains("sae") ->
+                specifierBuilder.setWpa3Passphrase(passphrase)
+            else -> specifierBuilder.setWpa2Passphrase(passphrase)
+        }
+
+        val exactBssid = offer.bssid
+            ?.trim()
+            ?.takeIf { it.isNotBlank() && !it.equals("unreported", ignoreCase = true) }
+            ?.let { value -> runCatching { MacAddress.fromString(value) }.getOrNull() }
+        if (exactBssid != null) specifierBuilder.setBssid(exactBssid)
+
+        val matchMode = if (exactBssid != null) {
+            "EXACT_SSID_BSSID"
+        } else {
+            "EXACT_SSID_ONLY"
+        }
+        ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_MATCH=$matchMode")
+
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .setNetworkSpecifier(specifier)
+            .setNetworkSpecifier(specifierBuilder.build())
             .build()
+        val latch = CountDownLatch(1)
+        val selected = java.util.concurrent.atomic.AtomicReference<Network?>()
+        val unavailable = AtomicBoolean(false)
 
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                availableNetwork.set(network)
-                wifiNetwork = network
-                ArdaCompanionState.wifiConnected.value = true
-                ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI=PASS")
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_SELECTION_RESULT=CONNECTED attempt=$attemptName",
-                )
-                persistObservedBssid(offer, network)
-                logNetwork("WIFI", network)
-                latch.countDown()
+        fun available(network: Network) {
+            if (!selected.compareAndSet(null, network)) return
+            wifiNetwork = network
+            ArdaCompanionState.wifiConnected.value = true
+            ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI=PASS")
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_WIFI_SELECTION_RESULT=CONNECTED_ACTIVE_REQUEST",
+            )
+            logNetwork("WIFI", network)
+            latch.countDown()
+        }
+
+        fun lost(network: Network) {
+            if (network == wifiNetwork) {
+                wifiNetwork = null
+                ArdaCompanionState.wifiConnected.value = false
+                ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI_LOST=YES")
             }
+        }
 
-            override fun onLost(network: Network) {
-                if (network == wifiNetwork) {
-                    wifiNetwork = null
-                    ArdaCompanionState.wifiConnected.value = false
-                    ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI_LOST=YES")
+        val callback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            object : ConnectivityManager.NetworkCallback(
+                ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO,
+            ) {
+                override fun onAvailable(network: Network) = available(network)
+                override fun onLost(network: Network) = lost(network)
+                override fun onUnavailable() {
+                    unavailable.set(true)
+                    latch.countDown()
                 }
             }
-
-            override fun onUnavailable() {
-                unavailable.set(true)
-                ArdaCompanionState.log(
-                    "ARDA_RN3B_PHONE_WIFI_ATTEMPT_UNAVAILABLE=$attemptName",
-                )
-                latch.countDown()
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = available(network)
+                override fun onLost(network: Network) = lost(network)
+                override fun onUnavailable() {
+                    unavailable.set(true)
+                    latch.countDown()
+                }
             }
         }
         wifiCallback = callback
 
         ArdaCompanionState.log(
             "ARDA_RN3B_PHONE_WIFI_SELECTION_WAIT=START " +
-                "attempt=$attemptName;timeout_ms=$timeoutMs",
+                "attempt=$matchMode;timeout_ms=$timeoutMs",
         )
-        connectivityManager.requestNetwork(request, callback, mainHandler)
+        connectivityManager.requestNetwork(
+            request,
+            callback,
+            mainHandler,
+            timeoutMs.toInt(),
+        )
 
-        val signalled = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
-        val network = availableNetwork.get()
-        if (network != null) {
-            return network
+        if (!latch.await(timeoutMs + CALLBACK_GRACE_MS, TimeUnit.MILLISECONDS)) {
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+            if (wifiCallback === callback) wifiCallback = null
+            ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_ACTIVE_REQUEST=TIMEOUT")
+            error("Timed out requesting ARDA local-only Wi-Fi")
+        }
+        if (unavailable.get() || selected.get() == null) {
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+            if (wifiCallback === callback) wifiCallback = null
+            ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_ACTIVE_REQUEST=UNAVAILABLE")
+            error("Android rejected or could not find ARDA local-only Wi-Fi")
+        }
+        return selected.get() ?: error("ARDA local-only Wi-Fi callback returned no network")
+    }
+
+    private fun waitForSavedNetworkBlocking(
+        offer: ArdaWifiOffer,
+        timeoutMs: Long,
+        phase: String,
+    ): Network? {
+        val latch = CountDownLatch(1)
+        val selected = java.util.concurrent.atomic.AtomicReference<Network?>()
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+
+        fun consider(
+            network: Network,
+            capabilities: NetworkCapabilities?,
+        ) {
+            if (selected.get() != null) return
+            val match = savedNetworkMatch(network, capabilities, offer) ?: return
+            if (!selected.compareAndSet(null, network)) return
+            wifiNetwork = network
+            ArdaCompanionState.wifiConnected.value = true
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SAVED_NETWORK_MATCH=$match phase=$phase",
+            )
+            ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI=PASS")
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_WIFI_SELECTION_RESULT=AUTO_CONNECTED_SAVED_NETWORK",
+            )
+            logNetwork("WIFI", network)
+            latch.countDown()
         }
 
-        if (!signalled) {
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_ATTEMPT_TIMEOUT=$attemptName",
-            )
-        } else if (unavailable.get()) {
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_ATTEMPT_RESULT=$attemptName:UNAVAILABLE",
-            )
+        fun lost(network: Network) {
+            if (network == wifiNetwork) {
+                wifiNetwork = null
+                ArdaCompanionState.wifiConnected.value = false
+                ArdaCompanionState.log("ARDA_RN3B_PHONE_LOCAL_WIFI_LOST=YES")
+            }
         }
 
-        runCatching { connectivityManager.unregisterNetworkCallback(callback) }
-        if (wifiCallback === callback) {
-            wifiCallback = null
+        val callback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            object : ConnectivityManager.NetworkCallback(
+                ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO,
+            ) {
+                override fun onAvailable(network: Network) {
+                    consider(network, connectivityManager.getNetworkCapabilities(network))
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    consider(network, networkCapabilities)
+                }
+
+                override fun onLost(network: Network) = lost(network)
+            }
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    consider(network, connectivityManager.getNetworkCapabilities(network))
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    consider(network, networkCapabilities)
+                }
+
+                override fun onLost(network: Network) = lost(network)
+            }
+        }
+        wifiCallback = callback
+        connectivityManager.registerNetworkCallback(request, callback, mainHandler)
+
+        connectivityManager.allNetworks.forEach { network ->
+            consider(network, connectivityManager.getNetworkCapabilities(network))
+        }
+
+        if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+            if (wifiCallback === callback) wifiCallback = null
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SAVED_NETWORK_WAIT=TIMEOUT phase=$phase",
+            )
+            return null
+        }
+        return selected.get()
+    }
+
+    private fun savedNetworkMatch(
+        network: Network,
+        capabilities: NetworkCapabilities?,
+        offer: ArdaWifiOffer,
+    ): String? {
+        if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true) {
+            return null
+        }
+
+        val wifiInfo = capabilities.transportInfo as? WifiInfo
+        val observedSsid = wifiInfo?.ssid
+            ?.trim()
+            ?.trim('"')
+            ?.takeUnless { it.equals("<unknown ssid>", ignoreCase = true) }
+        if (observedSsid == offer.ssid) return "SSID"
+
+        val expectedApIp = offer.apIp
+        if (!expectedApIp.isNullOrBlank()) {
+            val link = connectivityManager.getLinkProperties(network)
+            val gatewayMatch = link?.routes?.any { route ->
+                route.gateway?.hostAddress == expectedApIp
+            } == true
+            if (gatewayMatch) return "AP_IP_GATEWAY"
         }
         return null
     }
@@ -469,91 +535,6 @@ class ReverseProxyController(private val context: Context) : Closeable {
             Thread.sleep(200)
         }
         return findIpv4Address(connectivityManager.getLinkProperties(network))
-    }
-
-    private fun buildWifiSpecifier(
-        offer: ArdaWifiOffer,
-        requestedBssid: String?,
-    ): WifiNetworkSpecifier {
-        val builder = WifiNetworkSpecifier.Builder().setSsid(offer.ssid)
-        requestedBssid?.let {
-            builder.setBssid(MacAddress.fromString(it))
-            ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_MATCH=EXACT_SSID_BSSID")
-            ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_BSSID=$it")
-        } ?: ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_MATCH=EXACT_SSID_ONLY")
-        when (offer.security.lowercase(Locale.US)) {
-            "open" -> Unit
-            "wpa2" -> builder.setWpa2Passphrase(
-                requireNotNull(offer.passphrase) { "WPA2 offer has no passphrase" },
-            )
-            "wpa3" -> builder.setWpa3Passphrase(
-                requireNotNull(offer.passphrase) { "WPA3 offer has no passphrase" },
-            )
-            else -> error("Unsupported ARDA local Wi-Fi security: ${offer.security}")
-        }
-        return builder.build()
-    }
-
-    private fun persistObservedBssid(offer: ArdaWifiOffer, network: Network) {
-        val wifiInfo = connectivityManager
-            .getNetworkCapabilities(network)
-            ?.transportInfo as? WifiInfo
-        val observedBssid = normalizeBssid(wifiInfo?.bssid)
-        if (observedBssid == null) {
-            ArdaCompanionState.log(
-                "ARDA_RN3B_PHONE_WIFI_OBSERVED_BSSID=UNAVAILABLE",
-            )
-            return
-        }
-
-        val committed = wifiApprovalPreferences.edit()
-            .putString(KEY_APPROVED_SSID, offer.ssid)
-            .putString(KEY_APPROVED_BSSID, observedBssid)
-            .putInt(KEY_APPROVED_CREDENTIAL, credentialFingerprint(offer))
-            .commit()
-        ArdaCompanionState.log("ARDA_RN3B_PHONE_WIFI_OBSERVED_BSSID=$observedBssid")
-        ArdaCompanionState.log(
-            "ARDA_RN3B_PHONE_WIFI_APPROVAL_IDENTITY_SAVED=" +
-                if (committed) "PASS" else "FAIL",
-        )
-    }
-
-    private fun loadSavedBssid(offer: ArdaWifiOffer): String? {
-        val savedSsid = wifiApprovalPreferences.getString(KEY_APPROVED_SSID, null)
-        val savedCredential = wifiApprovalPreferences.getInt(
-            KEY_APPROVED_CREDENTIAL,
-            Int.MIN_VALUE,
-        )
-        if (savedSsid != offer.ssid || savedCredential != credentialFingerprint(offer)) {
-            return null
-        }
-        return normalizeBssid(
-            wifiApprovalPreferences.getString(KEY_APPROVED_BSSID, null),
-        )
-    }
-
-    private fun clearSavedBssid() {
-        wifiApprovalPreferences.edit()
-            .remove(KEY_APPROVED_SSID)
-            .remove(KEY_APPROVED_BSSID)
-            .remove(KEY_APPROVED_CREDENTIAL)
-            .apply()
-    }
-
-    private fun credentialFingerprint(offer: ArdaWifiOffer): Int =
-        "${offer.security.lowercase(Locale.US)}|${offer.passphrase.orEmpty()}".hashCode()
-
-    private fun normalizeBssid(value: String?): String? {
-        val normalized = value
-            ?.trim()
-            ?.uppercase(Locale.US)
-            ?.takeIf { it.matches(BSSID_PATTERN) }
-            ?: return null
-        return normalized.takeUnless {
-            it == "00:00:00:00:00:00" ||
-                it == "02:00:00:00:00:00" ||
-                it == "FF:FF:FF:FF:FF:FF"
-        }
     }
 
     private fun logNetwork(prefix: String, network: Network) {
@@ -807,19 +788,11 @@ class ReverseProxyController(private val context: Context) : Closeable {
     }
 
     companion object {
-        private const val WIFI_SELECTION_TIMEOUT_MS = 120_000L
-        private const val WIFI_DISCOVERY_TIMEOUT_MS = 45_000L
-        private const val WIFI_SCAN_RETRY_INTERVAL_MS = 5_000L
-        private const val WIFI_SCAN_POLL_INTERVAL_MS = 500L
-        private const val EXACT_BSSID_RECONNECT_TIMEOUT_MS = 20_000L
+        private const val WIFI_SELECTION_TIMEOUT_MS = 180_000L
+        private const val AUTOJOIN_PRECHECK_TIMEOUT_MS = 3_000L
+        private const val POST_ENROLLMENT_AUTOJOIN_TIMEOUT_MS = 5_000L
+        private const val SAVED_NETWORK_ENROLLMENT_TIMEOUT_MS = 180_000L
         private const val CELLULAR_REQUEST_TIMEOUT_MS = 45_000L
-        private const val WIFI_APPROVAL_PREFS = "arda_rn3b_wifi_approval"
-        private const val KEY_APPROVED_SSID = "approved_ssid"
-        private const val KEY_APPROVED_BSSID = "approved_bssid"
-        private const val KEY_APPROVED_CREDENTIAL = "approved_credential"
-        private val BSSID_PATTERN = Regex(
-            "^[0-9A-F]{2}(:[0-9A-F]{2}){5}$",
-        )
         private const val CALLBACK_GRACE_MS = 2_000L
         private const val IPV4_WAIT_TIMEOUT_MS = 10_000L
 

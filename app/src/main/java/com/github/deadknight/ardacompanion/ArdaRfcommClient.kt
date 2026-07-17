@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 class ArdaRfcommClient(
     private val context: Context,
+    private val onSessionReady: (String) -> Unit = {},
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val requestIds = AtomicLong(1)
@@ -140,6 +141,7 @@ class ArdaRfcommClient(
                     "ARDA_RN3B_PHONE_PROXY_CONNECT_TEST_STATUS=" +
                         proxyJson.optString("connect_test_status"),
                 )
+                notifySessionReady(endpoint)
             } else {
                 // LocalOnlyHotspot is useful independently from cellular egress.
                 // Keep RFCOMM alive so the local Wi-Fi gate can be inspected and
@@ -147,6 +149,7 @@ class ArdaRfcommClient(
                 ArdaCompanionState.log(
                     "ARDA_RN3B_PHONE_LOCAL_ONLY_ACTIVE=${endpoint.phoneIp}",
                 )
+                notifySessionReady(endpoint)
             }
 
             if (!keepOpen) {
@@ -260,6 +263,11 @@ class ArdaRfcommClient(
             expectedRequestId = pingId,
         )
         ArdaCompanionState.log("ARDA_RN3B_PHONE_PONG_RX=PASS")
+    }
+
+    private fun notifySessionReady(endpoint: ArdaProxyEndpoint) {
+        val mode = if (endpoint.proxyAvailable) "reverse_proxy" else "local_only"
+        onSessionReady(mode)
     }
 
     private fun hasConnectPermission(): Boolean =

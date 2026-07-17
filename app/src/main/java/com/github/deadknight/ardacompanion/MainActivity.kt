@@ -60,6 +60,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        ArdaBootstrapService.savedAddress(this)?.let { address ->
+            ArdaCompanionPresence.ensureObserving(applicationContext, address)
+        }
+
         setContent {
             ArdaCompanionTheme {
                 ArdaCompanionApp()

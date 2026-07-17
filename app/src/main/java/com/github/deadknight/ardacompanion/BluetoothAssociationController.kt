@@ -102,6 +102,10 @@ class BluetoothAssociationController(
         ).edit()
             .putString(ArdaBootstrapService.KEY_ADDRESS, address)
             .apply()
+        ArdaCompanionPresence.ensureObserving(
+            activity.applicationContext,
+            address,
+        )
     }
 
     @Suppress("DEPRECATION")

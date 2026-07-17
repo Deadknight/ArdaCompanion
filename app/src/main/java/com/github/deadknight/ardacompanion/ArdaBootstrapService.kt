@@ -2,21 +2,32 @@ package com.github.deadknight.ardacompanion
 
 import android.Manifest
 import android.app.Notification
+import android.app.PendingIntent
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.companion.CompanionDeviceManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import java.util.concurrent.Executors
 
+/**
+ * Session-scoped foreground service. It is not a permanent Bluetooth
+ * listener: CompanionDeviceService or the ACL receiver starts this service
+ * directly when the associated AAOS device appears. The Activity is only used
+ * when Android requires explicit user interaction such as first Wi-Fi save.
+ */
 class ArdaBootstrapService : Service() {
     private val executor = Executors.newSingleThreadExecutor()
-    private var client: ArdaRfcommClient? = null
+
+    @Volatile private var client: ArdaRfcommClient? = null
+    @Volatile private var activeAddress: String? = null
+    @Volatile private var sessionReadyMode: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -25,19 +36,19 @@ class ArdaBootstrapService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> stopClient()
+            ACTION_STOP -> stopClient(intent.getStringExtra(EXTRA_ADDRESS))
             ACTION_CONNECT -> {
-                // startForegroundService() requires this call even when validation later fails.
-                // Doing address lookup first caused ForegroundServiceDidNotStartInTimeException.
+                // Required immediately after startForegroundService().
                 startForeground(
                     NOTIFICATION_ID,
                     buildNotification("Resolving AAOS Bluetooth device"),
                 )
 
-                val address = resolveAddress(
-                    intent.getStringExtra(EXTRA_ADDRESS),
+                val source = intent.getStringExtra(EXTRA_TRIGGER_SOURCE) ?: "UNKNOWN"
+                ArdaCompanionState.log(
+                    "ARDA_RN3B_PHONE_SESSION_SERVICE=STARTED source=$source",
                 )
-
+                val address = resolveAddress(intent.getStringExtra(EXTRA_ADDRESS))
                 if (address.isNullOrBlank()) {
                     ArdaCompanionState.log("ARDA_RN3B_PHONE_ADDRESS_MISSING=FAIL")
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -45,7 +56,7 @@ class ArdaBootstrapService : Service() {
                 } else {
                     startForeground(
                         NOTIFICATION_ID,
-                        buildNotification("Connecting Bluetooth and reverse proxy"),
+                        buildNotification("Connecting ARDA transport"),
                     )
                     startClient(address)
                 }
@@ -60,58 +71,103 @@ class ArdaBootstrapService : Service() {
             ?.takeIf(::isBluetoothAddress)
             ?.let {
                 ArdaCompanionState.log("ARDA_RN3B_PHONE_ADDRESS_SOURCE=INTENT")
-                return it
+                return it.uppercase()
             }
 
-        savedAddress()
+        savedAddress(this)
             ?.trim()
             ?.takeIf(::isBluetoothAddress)
             ?.let {
                 ArdaCompanionState.log("ARDA_RN3B_PHONE_ADDRESS_SOURCE=SAVED")
-                return it
+                return it.uppercase()
             }
 
         associatedAddresses().firstOrNull()?.let {
             ArdaCompanionState.log("ARDA_RN3B_PHONE_ADDRESS_SOURCE=ASSOCIATION")
-            return it
+            return it.uppercase()
         }
 
         return resolveBondedArdaAddress()?.also {
             ArdaCompanionState.log("ARDA_RN3B_PHONE_ADDRESS_SOURCE=BONDED")
-        }
+        }?.uppercase()
     }
 
+    @Synchronized
     private fun startClient(address: String) {
-        client?.close()
-        val newClient = ArdaRfcommClient(applicationContext)
+        val normalizedAddress = address.uppercase()
+        val currentClient = client
+        if (
+            currentClient != null &&
+            activeAddress.equals(normalizedAddress, ignoreCase = true)
+        ) {
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SESSION_ALREADY_ACTIVE=$normalizedAddress",
+            )
+            sessionReadyMode?.let(::broadcastSessionReady)
+            return
+        }
+
+        currentClient?.close()
+        sessionReadyMode = null
+        activeAddress = normalizedAddress
+
+        val newClient = ArdaRfcommClient(
+            context = applicationContext,
+            onSessionReady = { mode ->
+                sessionReadyMode = mode
+                updateNotification(
+                    if (mode == "reverse_proxy") {
+                        "ARDA Wi-Fi and cellular proxy active"
+                    } else {
+                        "ARDA local Wi-Fi active"
+                    },
+                )
+                broadcastSessionReady(mode)
+            },
+        )
         client = newClient
 
         getSharedPreferences(PREFS, MODE_PRIVATE)
             .edit()
-            .putString(KEY_ADDRESS, address)
+            .putString(KEY_ADDRESS, normalizedAddress)
             .apply()
-        ArdaCompanionState.selectedDeviceAddress.value = address
-        ArdaCompanionState.log("ARDA_RN3B_PHONE_SELECTED_ADDRESS=$address")
+        ArdaCompanionState.selectedDeviceAddress.value = normalizedAddress
+        ArdaCompanionState.log("ARDA_RN3B_PHONE_SELECTED_ADDRESS=$normalizedAddress")
 
         executor.execute {
             try {
                 newClient.connectAndRun(
-                    bluetoothAddress = address,
+                    bluetoothAddress = normalizedAddress,
                     keepOpen = true,
                 )
             } finally {
-                if (client === newClient) {
-                    client = null
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                synchronized(this) {
+                    if (client === newClient) {
+                        client = null
+                        activeAddress = null
+                        sessionReadyMode = null
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
         }
     }
 
-    private fun savedAddress(): String? =
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getString(KEY_ADDRESS, null)
+    private fun broadcastSessionReady(mode: String) {
+        getSystemService(NotificationManager::class.java).apply {
+            cancel(ENROLLMENT_NOTIFICATION_ID)
+            cancel(CONNECTION_NOTIFICATION_ID)
+        }
+        sendBroadcast(
+            Intent(ACTION_SESSION_READY)
+                .setPackage(packageName)
+                .putExtra(EXTRA_SESSION_MODE, mode),
+        )
+        ArdaCompanionState.log(
+            "ARDA_RN3B_PHONE_BACKGROUND_SERVICE=ACTIVE mode=$mode",
+        )
+    }
 
     private fun associatedAddresses(): List<String> {
         val manager = getSystemService(CompanionDeviceManager::class.java)
@@ -134,7 +190,8 @@ class ArdaBootstrapService : Service() {
     }
 
     private fun resolveBondedArdaAddress(): String? {
-        if (Build.VERSION.SDK_INT >= 31 &&
+        if (
+            Build.VERSION.SDK_INT >= 31 &&
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -149,7 +206,7 @@ class ArdaBootstrapService : Service() {
         val candidates = adapter.bondedDevices.orEmpty().toList()
         ArdaCompanionState.log("ARDA_RN3B_PHONE_BONDED_COUNT=${candidates.size}")
 
-        val ranked = candidates.sortedBy { device -> deviceScore(device) }
+        val ranked = candidates.sortedBy(::deviceScore)
         ranked.forEach { device ->
             val name = safeDeviceName(device).ifBlank { "<unknown>" }
             ArdaCompanionState.log(
@@ -158,9 +215,8 @@ class ArdaBootstrapService : Service() {
             )
         }
 
-        val likely = ranked.firstOrNull { deviceScore(it) < SCORE_OTHER }
-        if (likely != null) return likely.address
-        return ranked.singleOrNull()?.address
+        return ranked.firstOrNull { deviceScore(it) < SCORE_OTHER }?.address
+            ?: ranked.singleOrNull()?.address
     }
 
     private fun deviceScore(device: BluetoothDevice): Int {
@@ -184,14 +240,26 @@ class ArdaBootstrapService : Service() {
     private fun safeDeviceName(device: BluetoothDevice): String =
         runCatching { device.name.orEmpty() }.getOrDefault("")
 
-    private fun isBluetoothAddress(address: String): Boolean =
-        BLUETOOTH_ADDRESS.matches(address.trim())
+    @Synchronized
+    private fun stopClient(requestedAddress: String?) {
+        if (
+            !requestedAddress.isNullOrBlank() &&
+            !activeAddress.isNullOrBlank() &&
+            !activeAddress.equals(requestedAddress, ignoreCase = true)
+        ) {
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SESSION_STOP=IGNORED_OTHER_DEVICE address=$requestedAddress",
+            )
+            return
+        }
 
-    private fun stopClient() {
         client?.close()
         client = null
+        activeAddress = null
+        sessionReadyMode = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        ArdaCompanionState.log("ARDA_RN3B_PHONE_SESSION_STOP=PASS")
     }
 
     private fun createNotificationChannel() {
@@ -199,7 +267,7 @@ class ArdaBootstrapService : Service() {
             .createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
-                    "ARDA Bluetooth and reverse proxy",
+                    "ARDA active transport",
                     NotificationManager.IMPORTANCE_LOW,
                 ),
             )
@@ -210,11 +278,20 @@ class ArdaBootstrapService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("ARDA Reverse Companion")
             .setContentText(text)
+            .setContentIntent(bootstrapPendingIntent(this, enrollmentOnly = false))
             .setOngoing(true)
             .build()
 
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
     override fun onDestroy() {
         client?.close()
+        client = null
+        activeAddress = null
+        sessionReadyMode = null
         executor.shutdownNow()
         super.onDestroy()
     }
@@ -226,17 +303,155 @@ class ArdaBootstrapService : Service() {
             "com.github.deadknight.ardacompanion.action.CONNECT_RFCOMM"
         const val ACTION_STOP =
             "com.github.deadknight.ardacompanion.action.STOP_RFCOMM"
+        const val ACTION_SESSION_READY =
+            "com.github.deadknight.ardacompanion.action.SESSION_READY"
         const val EXTRA_ADDRESS = "bluetooth_address"
+        const val EXTRA_SESSION_MODE = "session_mode"
+        const val EXTRA_TRIGGER_SOURCE = "trigger_source"
 
         const val PREFS = "arda_companion"
         const val KEY_ADDRESS = "selected_bluetooth_address"
 
-        private const val CHANNEL_ID = "arda_bt_bootstrap"
-        private const val NOTIFICATION_ID = 3203
+        internal const val CHANNEL_ID = "arda_bt_bootstrap"
+        internal const val NOTIFICATION_ID = 3203
+        private const val INTERACTION_CHANNEL_ID = "arda_interaction_required"
+        private const val ENROLLMENT_NOTIFICATION_ID = 3204
+        private const val CONNECTION_NOTIFICATION_ID = 3205
         private const val SCORE_UUID = 0
         private const val SCORE_NAME = 1
         private const val SCORE_OTHER = 2
         private val BLUETOOTH_ADDRESS =
             Regex("(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+        fun startSessionFromBackground(
+            context: Context,
+            address: String,
+            source: String,
+        ): Boolean {
+            val normalizedAddress = address.trim().uppercase()
+            if (!isBluetoothAddress(normalizedAddress)) return false
+            val intent = Intent(context, ArdaBootstrapService::class.java)
+                .setAction(ACTION_CONNECT)
+                .putExtra(EXTRA_ADDRESS, normalizedAddress)
+                .putExtra(EXTRA_TRIGGER_SOURCE, source)
+            return runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+                ArdaCompanionState.log(
+                    "ARDA_RN3B_PHONE_SESSION_SERVICE=START_REQUESTED " +
+                        "source=$source address=$normalizedAddress",
+                )
+                true
+            }.getOrElse { error ->
+                ArdaCompanionState.log(
+                    "ARDA_RN3B_PHONE_SESSION_SERVICE=START_FAILED " +
+                        "source=$source error=${error.javaClass.simpleName}:" +
+                        (error.message ?: "no-message"),
+                )
+                notifyConnectionTapRequired(context, normalizedAddress)
+                false
+            }
+        }
+
+        fun notifyEnrollmentRequired(
+            context: Context,
+            ssid: String,
+        ) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            ensureInteractionChannel(manager)
+            val notification = Notification.Builder(context, INTERACTION_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("ARDA Wi-Fi setup required")
+                .setContentText("Tap to save $ssid and continue the ARDA connection")
+                .setContentIntent(bootstrapPendingIntent(context, enrollmentOnly = true))
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .build()
+            manager.notify(ENROLLMENT_NOTIFICATION_ID, notification)
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SAVED_NETWORK_NOTIFICATION=POSTED ssid=$ssid",
+            )
+        }
+
+        private fun notifyConnectionTapRequired(
+            context: Context,
+            address: String,
+        ) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            ensureInteractionChannel(manager)
+            val notification = Notification.Builder(context, INTERACTION_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentTitle("ARDA connection ready")
+                .setContentText("Tap once to allow the ARDA transport session")
+                .setContentIntent(
+                    bootstrapPendingIntent(
+                        context = context,
+                        enrollmentOnly = false,
+                        explicitAddress = address,
+                    ),
+                )
+                .setAutoCancel(true)
+                .build()
+            manager.notify(CONNECTION_NOTIFICATION_ID, notification)
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_SESSION_NOTIFICATION=POSTED address=$address",
+            )
+        }
+
+        private fun ensureInteractionChannel(manager: NotificationManager) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    INTERACTION_CHANNEL_ID,
+                    "ARDA connection actions",
+                    NotificationManager.IMPORTANCE_HIGH,
+                ),
+            )
+        }
+
+        private fun bootstrapPendingIntent(
+            context: Context,
+            enrollmentOnly: Boolean,
+            explicitAddress: String? = null,
+        ): PendingIntent {
+            val address = explicitAddress ?: savedAddress(context)
+            val intent = Intent(context, BluetoothBootstrapActivity::class.java)
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                )
+                .putExtra(BluetoothBootstrapActivity.EXTRA_ENROLLMENT_ONLY, enrollmentOnly)
+                .putExtra(
+                    BluetoothBootstrapActivity.EXTRA_FINISH_WHEN_SESSION_READY,
+                    true,
+                )
+            if (!enrollmentOnly) {
+                intent.putExtra(BluetoothBootstrapActivity.EXTRA_AUTO_CONNECT, true)
+                intent.putExtra(
+                    BluetoothBootstrapActivity.EXTRA_TRIGGER_SOURCE,
+                    "NOTIFICATION_TAP",
+                )
+            }
+            if (!address.isNullOrBlank()) {
+                intent.putExtra(EXTRA_ADDRESS, address)
+            }
+            return PendingIntent.getActivity(
+                context,
+                if (enrollmentOnly) ENROLLMENT_NOTIFICATION_ID else CONNECTION_NOTIFICATION_ID,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        }
+
+        fun savedAddress(context: Context): String? =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_ADDRESS, null)
+
+        fun isBluetoothAddress(address: String): Boolean =
+            BLUETOOTH_ADDRESS.matches(address.trim())
     }
 }

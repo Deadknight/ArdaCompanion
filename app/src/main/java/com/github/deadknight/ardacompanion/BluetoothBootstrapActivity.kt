@@ -1,13 +1,18 @@
 package com.github.deadknight.ardacompanion
 
 import android.Manifest
+import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.wifi.WifiNetworkSuggestion
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,10 +56,38 @@ import androidx.compose.ui.unit.dp
 class BluetoothBootstrapActivity : ComponentActivity() {
     private lateinit var associationController: BluetoothAssociationController
     private lateinit var autoPermissionLauncher: ActivityResultLauncher<Array<String>>
+    private lateinit var wifiEnrollmentLauncher: ActivityResultLauncher<Intent>
     private var pendingAutoConnectAddress: String? = null
+    private var activeWifiEnrollmentRequestId: Long? = null
+    private var autoFinishWhenSessionReady = false
+    private var sessionReadyReceiverRegistered = false
+    private val sessionReadyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ArdaBootstrapService.ACTION_SESSION_READY) return
+            if (!autoFinishWhenSessionReady || isFinishing || isDestroyed) return
+
+            val mode = intent.getStringExtra(ArdaBootstrapService.EXTRA_SESSION_MODE)
+                ?: "unknown"
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_ACTIVITY_FINISH=SESSION_READY mode=$mode",
+            )
+            finishAndRemoveTask()
+        }
+    }
+    private val wifiEnrollmentListener: (ArdaWifiEnrollmentCoordinator.Request) -> Unit =
+        { request -> launchWifiEnrollment(request) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        autoFinishWhenSessionReady =
+            intent.getBooleanExtra(EXTRA_AUTO_CONNECT, false) ||
+                intent.getBooleanExtra(EXTRA_FINISH_WHEN_SESSION_READY, false)
+        registerSessionReadyReceiver()
+
+        activeWifiEnrollmentRequestId = savedInstanceState
+            ?.takeIf { it.containsKey(STATE_WIFI_ENROLLMENT_REQUEST_ID) }
+            ?.getLong(STATE_WIFI_ENROLLMENT_REQUEST_ID)
 
         // Register every Activity Result launcher before this Activity reaches STARTED.
         autoPermissionLauncher = registerForActivityResult(
@@ -72,6 +105,35 @@ class BluetoothBootstrapActivity : ComponentActivity() {
             }
         }
 
+        wifiEnrollmentLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult(),
+        ) { result ->
+            val requestId = activeWifiEnrollmentRequestId
+            activeWifiEnrollmentRequestId = null
+            if (requestId == null) return@registerForActivityResult
+
+            val resultCodes = result.data?.getIntegerArrayListExtra(
+                Settings.EXTRA_WIFI_NETWORK_RESULT_LIST,
+            ).orEmpty()
+            val individualSuccess = resultCodes.isEmpty() || resultCodes.all { code ->
+                code == Settings.ADD_WIFI_RESULT_SUCCESS ||
+                    code == Settings.ADD_WIFI_RESULT_ALREADY_EXISTS
+            }
+            val accepted = result.resultCode == Activity.RESULT_OK && individualSuccess
+            val description = buildString {
+                append(if (accepted) "PASS" else "REJECTED_OR_FAILED")
+                append(";activity_result=").append(result.resultCode)
+                append(";network_results=")
+                append(if (resultCodes.isEmpty()) "none" else resultCodes.joinToString(","))
+            }
+            ArdaWifiEnrollmentCoordinator.complete(
+                requestId = requestId,
+                accepted = accepted,
+                resultDescription = description,
+            )
+        }
+        ArdaWifiEnrollmentCoordinator.attach(wifiEnrollmentListener)
+
         // Creating this controller from a Composable is too late on resumed activities.
         associationController = BluetoothAssociationController(
             activity = this,
@@ -88,6 +150,9 @@ class BluetoothBootstrapActivity : ComponentActivity() {
         val savedAddress = associationController.savedAddress()
         val selectedAddress = explicitAddress ?: savedAddress
         ArdaCompanionState.selectedDeviceAddress.value = selectedAddress
+        selectedAddress?.let {
+            ArdaCompanionPresence.ensureObserving(applicationContext, it)
+        }
 
         setContent {
             ArdaCompanionTheme {
@@ -95,9 +160,96 @@ class BluetoothBootstrapActivity : ComponentActivity() {
             }
         }
 
-        if (intent.getBooleanExtra(EXTRA_AUTO_CONNECT, false)) {
+        val enrollmentOnly = intent.getBooleanExtra(EXTRA_ENROLLMENT_ONLY, false)
+        if (enrollmentOnly) {
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_BOOTSTRAP_ACTIVITY=CREATED source=ENROLLMENT_NOTIFICATION " +
+                    "address=${selectedAddress ?: "unresolved"}",
+            )
+        } else if (intent.getBooleanExtra(EXTRA_AUTO_CONNECT, false)) {
+            val source = intent.getStringExtra(EXTRA_TRIGGER_SOURCE) ?: "UNKNOWN"
+            ArdaCompanionState.log(
+                "ARDA_RN3B_PHONE_BOOTSTRAP_ACTIVITY=CREATED source=$source " +
+                    "address=${selectedAddress ?: "unresolved"}",
+            )
             beginAutoConnect(selectedAddress)
         }
+    }
+
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        autoFinishWhenSessionReady =
+            intent.getBooleanExtra(EXTRA_AUTO_CONNECT, false) ||
+                intent.getBooleanExtra(EXTRA_FINISH_WHEN_SESSION_READY, false)
+        val source = intent.getStringExtra(EXTRA_TRIGGER_SOURCE) ?: "UNKNOWN"
+        val address = intent.getStringExtra(ArdaBootstrapService.EXTRA_ADDRESS)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        ArdaCompanionState.log(
+            "ARDA_RN3B_PHONE_BOOTSTRAP_ACTIVITY=NEW_INTENT source=$source " +
+                "address=${address ?: "unresolved"}",
+        )
+        val enrollmentOnly = intent.getBooleanExtra(EXTRA_ENROLLMENT_ONLY, false)
+        if (autoFinishWhenSessionReady && !enrollmentOnly) {
+            beginAutoConnect(address ?: associationController.savedAddress())
+        }
+    }
+
+    private fun launchWifiEnrollment(
+        request: ArdaWifiEnrollmentCoordinator.Request,
+    ) {
+        if (activeWifiEnrollmentRequestId == request.requestId) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            ArdaWifiEnrollmentCoordinator.complete(
+                requestId = request.requestId,
+                accepted = false,
+                resultDescription = "UNSUPPORTED_SDK_${Build.VERSION.SDK_INT}",
+            )
+            return
+        }
+
+        val suggestionBuilder = WifiNetworkSuggestion.Builder()
+            .setSsid(request.ssid)
+            .setIsInitialAutojoinEnabled(true)
+        when (request.security.lowercase()) {
+            "open" -> Unit
+            "wpa2" -> suggestionBuilder.setWpa2Passphrase(
+                requireNotNull(request.passphrase) { "WPA2 passphrase missing" },
+            )
+            "wpa3" -> suggestionBuilder.setWpa3Passphrase(
+                requireNotNull(request.passphrase) { "WPA3 passphrase missing" },
+            )
+            else -> {
+                ArdaWifiEnrollmentCoordinator.complete(
+                    requestId = request.requestId,
+                    accepted = false,
+                    resultDescription = "UNSUPPORTED_SECURITY_${request.security}",
+                )
+                return
+            }
+        }
+
+        val intent = Intent(Settings.ACTION_WIFI_ADD_NETWORKS)
+            .putParcelableArrayListExtra(
+                Settings.EXTRA_WIFI_NETWORK_LIST,
+                arrayListOf(suggestionBuilder.build()),
+            )
+        if (intent.resolveActivity(packageManager) == null) {
+            ArdaWifiEnrollmentCoordinator.complete(
+                requestId = request.requestId,
+                accepted = false,
+                resultDescription = "SETTINGS_ACTIVITY_NOT_FOUND",
+            )
+            return
+        }
+
+        activeWifiEnrollmentRequestId = request.requestId
+        ArdaCompanionState.log(
+            "ARDA_RN3B_PHONE_SAVED_NETWORK_UI=OPEN ssid=${request.ssid}",
+        )
+        wifiEnrollmentLauncher.launch(intent)
     }
 
     private fun beginAutoConnect(address: String?) {
@@ -121,8 +273,46 @@ class BluetoothBootstrapActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        activeWifiEnrollmentRequestId?.let {
+            outState.putLong(STATE_WIFI_ENROLLMENT_REQUEST_ID, it)
+        }
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun registerSessionReadyReceiver() {
+        if (sessionReadyReceiverRegistered) return
+        val filter = IntentFilter(ArdaBootstrapService.ACTION_SESSION_READY)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                sessionReadyReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(sessionReadyReceiver, filter)
+        }
+        sessionReadyReceiverRegistered = true
+    }
+
+    override fun onDestroy() {
+        ArdaWifiEnrollmentCoordinator.detach(wifiEnrollmentListener)
+        if (sessionReadyReceiverRegistered) {
+            runCatching { unregisterReceiver(sessionReadyReceiver) }
+            sessionReadyReceiverRegistered = false
+        }
+        super.onDestroy()
+    }
+
     companion object {
         const val EXTRA_AUTO_CONNECT = "arda_auto_connect"
+        const val EXTRA_TRIGGER_SOURCE = "arda_trigger_source"
+        const val EXTRA_ENROLLMENT_ONLY = "arda_enrollment_only"
+        const val EXTRA_FINISH_WHEN_SESSION_READY =
+            "arda_finish_when_session_ready"
+        private const val STATE_WIFI_ENROLLMENT_REQUEST_ID =
+            "arda_wifi_enrollment_request_id"
     }
 }
 
